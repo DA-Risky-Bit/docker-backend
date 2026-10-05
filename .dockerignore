@@ -1,0 +1,17 @@
+.git
+.gitignore
+
+/target/
+**/*.rs.bk
+
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+.env
+.env.*
+
+README.md
+.vscode/
+.idea/
+*.log
