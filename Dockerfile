@@ -1,17 +1,15 @@
-FROM rust:1.96.0-slim AS builder
+FROM node:24-alpine AS dependencies
 WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
 
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs # Dummy main for dep caching
-RUN cargo build --release
-RUN rm -rf src
-
-COPY src ./src
-RUN cargo build --release
-
-
-FROM debian:bookworm-slim
+FROM node:24-alpine AS production-dependencies
 WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
-COPY --from=builder /app/target/release/docker-backend /app/proxy-api
-CMD ["./proxy-api"]
+FROM node:24-alpine
+WORKDIR /app
+COPY --from=production-dependencies /app/node_modules ./node_modules
+COPY . .
+CMD ["npm", "run", "start"]
