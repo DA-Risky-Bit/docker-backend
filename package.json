@@ -7,8 +7,20 @@
   },
   "dependencies": {
     "cookie-parser": "~1.4.4",
+    "dockerode": "^5.0.1",
+    "dockerode-compose": "^1.4.0",
     "express": "^4.22.3",
     "http-errors": "~1.6.3",
     "morgan": "^1.12.1"
+  },
+  "devDependencies": {
+    "@types/cookie-parser": "^1.4.10",
+    "@types/dockerode": "^4.0.2",
+    "@types/dockerode-compose": "^1.4.2",
+    "@types/express": "^5.0.6",
+    "@types/http-errors": "^2.0.5",
+    "@types/morgan": "^1.9.10",
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
   }
 }
