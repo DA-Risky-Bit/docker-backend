@@ -3,7 +3,8 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "start": "node ./bin/www"
+    "build": "tsc",
+    "start": "node ./dist/bin/www"
   },
   "dependencies": {
     "cookie-parser": "~1.4.4",
@@ -15,6 +16,7 @@
   },
   "devDependencies": {
     "@types/cookie-parser": "^1.4.10",
+    "@types/debug": "^4.1.13",
     "@types/dockerode": "^4.0.2",
     "@types/dockerode-compose": "^1.4.2",
     "@types/express": "^5.0.6",
