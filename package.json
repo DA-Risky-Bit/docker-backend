@@ -3,13 +3,8 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-<<<<<<< HEAD
-    "build": "tsc",
-    "start": "node ./dist/bin/www"
-=======
     "dev": "tsx watch ./bin/www.ts",
     "start": "tsx ./bin/www.ts"
->>>>>>> I_worked_on_no_branch_help_me_please
   },
   "dependencies": {
     "cookie-parser": "~1.4.4",
