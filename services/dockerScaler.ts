@@ -4,7 +4,7 @@ import util from 'util';
 import path from 'path';
 
 const execPromise = util.promisify(exec);
-const docker = new Dockerode({ socketPath: '/var/run/docker.sock' });
+const docker = new Dockerode();
 
 export const dockerScaler = {
   async getActiveInstances(imageName: string) {
