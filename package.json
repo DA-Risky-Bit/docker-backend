@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "tsx watch ./bin/www.ts",
-    "start": "tsx ./bin/www.ts"
+    "build": "tsc",
+    "start": "node dist/bin/www.js"
   },
   "dependencies": {
     "cookie-parser": "~1.4.4",

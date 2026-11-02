@@ -55,8 +55,12 @@ function bindLifecycle(req: Request, res: Response, stream: Readable): void {
 const ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/;
 function getId(req: Request): string {
   const id = req.params.id;
-  if (!ID_RE.test(id)) throw Object.assign(new Error('Invalid container id'), { status: 400 });
-  return id;
+  const rawId = Array.isArray(id) ? id[0] : id;
+
+  if (!rawId || !ID_RE.test(rawId)) {
+    throw Object.assign(new Error('Invalid container id'), { status: 400 });
+  }
+  return rawId;
 }
 
 function calcStats(s: Docker.ContainerStats): StatsPayload {
@@ -127,6 +131,100 @@ export function createDockerRouter(docker: Docker = new Docker()): Router {
       }
     });
   }));
+
+  router.get('/logs', wrap(async (req, res) => {
+      const send = sseStart(res);
+      const attached = new Set<string>();
+      const streams = new Map<string, Readable>();
+      let closed = false;
+
+      // Splits raw output into complete lines of "<timestamp> <text>"
+      const lineReader = (name: string, stream: 'stdout' | 'stderr') => {
+        let buf = '';
+        const out = new PassThrough();
+        out.on('error', () => {});
+        out.on('data', (chunk: Buffer) => {
+          buf += chunk.toString('utf8');
+          const parts = buf.split('\n');
+          buf = parts.pop() ?? '';
+          for (const raw of parts) {
+            const line = raw.replace(/\r$/, '');
+            const i = line.indexOf(' ');
+            send('log', {
+              ts: i < 0 ? line : line.slice(0, i),
+              name,
+              stream,
+              text: i < 0 ? '' : line.slice(i + 1),
+            });
+          }
+        });
+        return out;
+      };
+
+      // since === undefined: last 20 lines (first connect). Otherwise only lines from that unix time on.
+      const attach = async (id: string, name: string, since?: number) => {
+        if (closed || attached.has(id)) return;
+        attached.add(id);
+        try {
+          const container = docker.getContainer(id);
+          const info = await container.inspect();
+          const stream = (await container.logs({
+            follow: true,
+            stdout: true,
+            stderr: true,
+            timestamps: true,
+            ...(since === undefined ? { tail: 20 } : { since }),
+          })) as unknown as Readable;
+
+          if (closed) {
+            stream.destroy();
+            return;
+          }
+          streams.set(id, stream);
+
+          const detach = () => {
+            streams.delete(id);
+            attached.delete(id); // lets a restarted container attach again
+          };
+          stream.on('error', detach); // required: unhandled stream errors crash the process
+          stream.on('end', detach);
+
+          if (info.Config.Tty) {
+            stream.pipe(lineReader(name, 'stdout'));
+          } else {
+            docker.modem.demuxStream(stream, lineReader(name, 'stdout'), lineReader(name, 'stderr'));
+          }
+        } catch {
+          attached.delete(id); // container vanished before we could attach
+        }
+      };
+
+      req.on('close', () => {
+        closed = true;
+        for (const s of streams.values()) s.destroy();
+        streams.clear();
+      });
+
+      // Containers that start later (restarts, scaled-up replicas) get picked up here.
+      // Registered before the initial listing so nothing is missed in between.
+      const events = (await docker.getEvents({
+        filters: { type: ['container'], event: ['start'], ...PROJECT },
+      })) as unknown as Readable;
+      bindLifecycle(req, res, events);
+      events.on('data', (chunk: Buffer) => {
+        for (const l of chunk.toString().split('\n').filter(Boolean)) {
+          try {
+            const ev = JSON.parse(l);
+            attach(ev.id, ev.Actor?.Attributes?.name ?? ev.id.slice(0, 12), ev.time);
+          } catch {
+            /* ignore partial chunk */
+          }
+        }
+      });
+
+      const running = await docker.listContainers({ filters: PROJECT });
+      await Promise.all(running.map((c) => attach(c.Id, c.Names[0]?.replace('/', '') ?? c.Id.slice(0, 12))));
+    }));
 
   router.get('/events', wrap(async (req, res) => {
     const send = sseStart(res);
