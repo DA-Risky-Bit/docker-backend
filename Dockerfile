@@ -12,8 +12,6 @@ FROM node:24-alpine
 WORKDIR /app
 
 COPY --from=production-dependencies /app/node_modules ./node_modules
-COPY --from=build /app/dist ./dist
-COPY package.json ./
+COPY . .
 
-# Run the compiled JavaScript output using standard Node.js
 CMD ["npm", "run", "start"]
