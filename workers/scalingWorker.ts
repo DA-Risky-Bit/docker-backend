@@ -8,6 +8,7 @@ interface FrontendService {
   maxReplicas: number;
 }
 
+
 const frontends: FrontendService[] = [
   {
     serviceName: 'admin-frontend',
@@ -32,31 +33,45 @@ const frontends: FrontendService[] = [
   },
 ];
 
-const CHECK_INTERVAL_MS = 30000;
+const CHECK_INTERVAL_MS = 30_000;
+const COOLDOWN_MS = 90_000;
+
+const lastScaled = new Map<string, number>();
+let running = false;
+
+async function tick() {
+  if (running) return;
+  running = true;
+  try {
+    for (const f of frontends) {
+      try {
+        const current = (await dockerScaler.getActiveInstances(f.serviceName)).length;
+        if (current === 0) continue;
+
+        const avgCpu = await dockerScaler.getAverageResourceUsage(f.serviceName);
+        console.log(`[${f.serviceName}] Replicas: ${current} | Avg CPU: ${avgCpu.toFixed(2)}%`);
+
+        if (Date.now() - (lastScaled.get(f.serviceName) ?? 0) < COOLDOWN_MS) continue;
+
+        let target = current;
+        if (avgCpu > 80 && current < f.maxReplicas) target = current + 1;
+        else if (avgCpu < 20 && current > f.minReplicas) target = current - 1;
+
+        if (target !== current) {
+          console.log(`Scaling ${f.serviceName}: ${current} -> ${target}`);
+          await dockerScaler.scaleService(f.serviceName, target);
+          lastScaled.set(f.serviceName, Date.now());
+        }
+      } catch (error) {
+        console.error(`Error in scaling loop for ${f.serviceName}:`, error);
+      }
+    }
+  } finally {
+    running = false;
+  }
+}
 
 export function startScalingWorker() {
   console.log('Docker Compose multi-service auto-scaler worker started...');
-
-  setInterval(async () => {
-    for (const frontend of frontends) {
-      try {
-        const avgCpuUsage = await dockerScaler.getAverageResourceUsage(frontend.imageName);
-        console.log(`[${frontend.serviceName}] Replicas: ${frontend.currentReplicas} | Avg CPU: ${avgCpuUsage.toFixed(2)}%`);
-
-        if (avgCpuUsage > 80 && frontend.currentReplicas < frontend.maxReplicas) {
-          frontend.currentReplicas++;
-          console.log(`High load on ${frontend.serviceName}. Scaling up to ${frontend.currentReplicas}...`);
-          await dockerScaler.scaleService(frontend.serviceName, frontend.currentReplicas);
-        }
-        else if (avgCpuUsage < 20 && frontend.currentReplicas > frontend.minReplicas) {
-          frontend.currentReplicas--;
-          console.log(`Low load on ${frontend.serviceName}. Scaling down to ${frontend.currentReplicas}...`);
-          await dockerScaler.scaleService(frontend.serviceName, frontend.currentReplicas);
-        }
-
-      } catch (error) {
-        console.error(`Error in scaling loop for ${frontend.serviceName}:`, error);
-      }
-    }
-  }, CHECK_INTERVAL_MS);
+  setInterval(tick, CHECK_INTERVAL_MS);
 }

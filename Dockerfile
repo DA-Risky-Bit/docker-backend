@@ -18,6 +18,8 @@ FROM node:24-alpine
 WORKDIR /app
 ENV NODE_ENV=production
 
+RUN apk add --no-cache docker-cli docker-cli-compose
+
 COPY --from=production-dependencies /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./
