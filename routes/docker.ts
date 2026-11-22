@@ -1,0 +1,363 @@
+import { Router, Request, Response, NextFunction, RequestHandler } from 'express';
+import Docker from 'dockerode';
+import { PassThrough, Readable } from 'stream';
+
+const docker = new Docker({ socketPath: '/var/run/docker.sock' });
+
+const PROJECT_NAME = 'riskybit';
+const PROJECT = { label: [`com.docker.compose.project=${PROJECT_NAME}`] };
+
+type SendFn = (event: string, data: unknown) => void;
+
+interface StatsPayload {
+  cpuPct: number;
+  memUsed: number;
+  memLimit: number;
+  net: Docker.ContainerStats['networks'];
+  blkio: Docker.ContainerStats['blkio_stats'];
+}
+const ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/;
+
+type HttpError = Error & { status?: number; statusCode?: number };
+
+const wrap =
+  (fn: (req: Request, res: Response) => Promise<void>): RequestHandler =>
+  (req, res, next: NextFunction) => {
+    fn(req, res).catch(next);
+  };
+
+function sseStart(res: Response): SendFn {
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders();
+
+  const alive = () => !res.writableEnded && !res.destroyed;
+
+  // Comment lines keep idle connections open through proxies
+  const heartbeat = setInterval(() => {
+    if (alive()) res.write(': ping\n\n');
+  }, 15_000);
+  heartbeat.unref();
+  res.on('close', () => clearInterval(heartbeat));
+
+  return (event, data) => {
+    if (!alive()) return;
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+}
+
+/**
+ * Ties an upstream Docker stream to the client connection.
+ * An unhandled 'error' event on a Node stream crashes the whole process, and
+ * destroying a Docker response stream (every tab close / effect re-mount)
+ * emits one. Always attach this.
+ */
+function bindLifecycle(res: Response, stream: Readable): void {
+  stream.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code !== 'ECONNRESET') console.error('[docker stream]', err.message);
+    if (!res.writableEnded) res.end();
+  });
+  stream.on('end', () => {
+    if (!res.writableEnded) res.end();
+  });
+  res.on('error', () => stream.destroy());
+  res.on('close', () => stream.destroy());
+}
+
+/** Parses a stream of newline-delimited JSON, tolerating split and merged chunks. */
+function onJsonLines(stream: Readable, handler: (obj: any) => void): void {
+  let buf = '';
+  stream.on('data', (chunk: Buffer) => {
+    buf += chunk.toString('utf8');
+    const parts = buf.split('\n');
+    buf = parts.pop() ?? '';
+    for (const line of parts) {
+      if (!line.trim()) continue;
+      try {
+        handler(JSON.parse(line));
+      } catch {
+        /* ignore malformed line */
+      }
+    }
+  });
+}
+
+function getId(req: Request): string {
+  const id = req.params.id;
+  const rawId = Array.isArray(id) ? id[0] : id;
+  if (!rawId || !ID_RE.test(rawId)) {
+    throw Object.assign(new Error('Invalid container id'), { status: 400 });
+  }
+  return rawId;
+}
+
+/** Resolves a container and makes sure it belongs to this compose project. */
+async function getProjectContainer(req: Request) {
+  const container = docker.getContainer(getId(req));
+  const info = await container.inspect(); // throws 404 if missing
+  if (info.Config.Labels?.['com.docker.compose.project'] !== PROJECT_NAME) {
+    throw Object.assign(new Error('Container not found'), { status: 404 });
+  }
+  return { container, info };
+}
+
+function calcStats(s: Docker.ContainerStats): StatsPayload {
+  const cpuDelta = s.cpu_stats.cpu_usage.total_usage - s.precpu_stats.cpu_usage.total_usage;
+  const sysDelta = (s.cpu_stats.system_cpu_usage ?? 0) - (s.precpu_stats.system_cpu_usage ?? 0);
+  const cpus = s.cpu_stats.online_cpus || 1;
+  const cpuPct = sysDelta > 0 ? (cpuDelta / sysDelta) * cpus * 100 : 0;
+
+  const mstats = (s.memory_stats.stats ?? {}) as Record<string, number>;
+  const memCache = mstats.inactive_file ?? mstats.cache ?? 0;
+
+  return {
+    cpuPct,
+    memUsed: s.memory_stats.usage - memCache,
+    memLimit: s.memory_stats.limit,
+    net: s.networks,
+    blkio: s.blkio_stats,
+  };
+}
+
+const router = Router();
+
+router.get('/containers', wrap(async (_req, res) => {
+  res.json(await docker.listContainers({ all: true, filters: PROJECT }));
+}));
+
+router.get('/containers/:id/logs', wrap(async (req, res) => {
+  const { container, info } = await getProjectContainer(req);
+
+  const send = sseStart(res);
+  const stream = (await container.logs({
+    follow: true,
+    stdout: true,
+    stderr: true,
+    tail: 100,
+    timestamps: true,
+  })) as unknown as Readable;
+
+  bindLifecycle(res, stream);
+
+  if (info.Config.Tty) {
+    stream.on('data', (c: Buffer) => send('stdout', c.toString()));
+  } else {
+    const out = new PassThrough();
+    const err = new PassThrough();
+    out.on('error', () => {});
+    err.on('error', () => {});
+    docker.modem.demuxStream(stream, out, err);
+    out.on('data', (c: Buffer) => send('stdout', c.toString()));
+    err.on('data', (c: Buffer) => send('stderr', c.toString()));
+  }
+}));
+
+router.get('/containers/:id/stats', wrap(async (req, res) => {
+  const { container } = await getProjectContainer(req);
+
+  const send = sseStart(res);
+  const stream = (await container.stats({ stream: true })) as unknown as Readable;
+
+  bindLifecycle(res, stream);
+  onJsonLines(stream, (s) => send('stats', calcStats(s as Docker.ContainerStats)));
+}));
+
+router.get('/logs', wrap(async (req, res) => {
+  const send = sseStart(res);
+  const attached = new Set<string>();
+  const streams = new Map<string, Readable>();
+  let closed = false;
+
+  // Splits raw output into complete lines of "<timestamp> <text>"
+  const lineReader = (name: string, stream: 'stdout' | 'stderr') => {
+    let buf = '';
+    const out = new PassThrough();
+    out.on('error', () => {});
+    out.on('data', (chunk: Buffer) => {
+      buf += chunk.toString('utf8');
+      const parts = buf.split('\n');
+      buf = parts.pop() ?? '';
+      for (const raw of parts) {
+        const line = raw.replace(/\r$/, '');
+        const i = line.indexOf(' ');
+        send('log', {
+          ts: i < 0 ? line : line.slice(0, i),
+          name,
+          stream,
+          text: i < 0 ? '' : line.slice(i + 1),
+        });
+      }
+    });
+    return out;
+  };
+
+  // since === undefined: last 20 lines (first connect). Otherwise only lines from that unix time on.
+  const attach = async (id: string, name: string, since?: number) => {
+    if (closed || attached.has(id)) return;
+    attached.add(id);
+    try {
+      const container = docker.getContainer(id);
+      const info = await container.inspect();
+      const stream = (await container.logs({
+        follow: true,
+        stdout: true,
+        stderr: true,
+        timestamps: true,
+        ...(since === undefined ? { tail: 20 } : { since }),
+      })) as unknown as Readable;
+
+      if (closed) {
+        stream.destroy();
+        return;
+      }
+      streams.set(id, stream);
+
+      const detach = () => {
+        streams.delete(id);
+        attached.delete(id); // lets a restarted container attach again
+      };
+      stream.on('error', detach); // required: unhandled stream errors crash the process
+      stream.on('end', detach);
+
+      if (info.Config.Tty) {
+        stream.pipe(lineReader(name, 'stdout'));
+      } else {
+        docker.modem.demuxStream(stream, lineReader(name, 'stdout'), lineReader(name, 'stderr'));
+      }
+    } catch {
+      attached.delete(id); // container vanished before we could attach
+    }
+  };
+
+  res.on('close', () => {
+    closed = true;
+    for (const s of streams.values()) s.destroy();
+    streams.clear();
+  });
+
+  // Containers that start later (restarts, scaled-up replicas) get picked up here.
+  // Registered before the initial listing so nothing is missed in between.
+  const events = (await docker.getEvents({
+    filters: { type: ['container'], event: ['start'], ...PROJECT },
+  })) as unknown as Readable;
+  bindLifecycle(res, events);
+  onJsonLines(events, (ev) => {
+    attach(ev.id, ev.Actor?.Attributes?.name ?? ev.id.slice(0, 12), ev.time);
+  });
+
+  const running = await docker.listContainers({ filters: PROJECT });
+  await Promise.all(running.map((c) => attach(c.Id, c.Names[0]?.replace('/', '') ?? c.Id.slice(0, 12))));
+}));
+
+router.get('/events', wrap(async (req, res) => {
+  const send = sseStart(res);
+  const stream = (await docker.getEvents({
+    filters: { type: ['container'], ...PROJECT }, // project only, no host-wide leak
+  })) as unknown as Readable;
+
+  bindLifecycle(res, stream);
+  onJsonLines(stream, (ev) => send('docker', ev));
+}));
+
+router.get('/info', wrap(async (_req, res) => {
+  const [i, list] = await Promise.all([
+    docker.info(),
+    docker.listContainers({ all: true, filters: PROJECT }),
+  ]);
+
+  const count = (state: string) => list.filter((c) => c.State === state).length;
+  const running = count('running');
+  const paused = count('paused');
+
+  res.json({
+    containers: list.length,
+    running,
+    paused,
+    stopped: list.length - running - paused, // exited, created, dead
+    images: i.Images, // still host-wide, not project-filtered
+    ncpu: i.NCPU,
+    memTotal: i.MemTotal,
+    serverVersion: i.ServerVersion,
+    os: i.OperatingSystem,
+  });
+}));
+
+router.get('/stats', wrap(async (req, res) => {
+  const send = sseStart(res);
+  const streams = new Map<string, Readable>();
+  const latest = new Map<string, StatsPayload>();
+  let closed = false;
+  let reconcileTimer: NodeJS.Timeout | undefined;
+  let snapshotTimer: NodeJS.Timeout | undefined;
+
+  const drop = (id: string) => {
+    streams.delete(id);
+    latest.delete(id);
+  };
+
+  const open = async (id: string) => {
+    if (streams.has(id)) return;
+    try {
+      const stream = (await docker.getContainer(id).stats({ stream: true })) as unknown as Readable;
+      if (closed) {
+        stream.destroy();
+        return;
+      }
+      streams.set(id, stream);
+      onJsonLines(stream, (s) => latest.set(id, calcStats(s as Docker.ContainerStats)));
+      stream.on('error', () => drop(id)); // required: unhandled stream errors crash the process
+      stream.on('end', () => drop(id));
+    } catch {
+      /* container vanished before we could attach */
+    }
+  };
+
+  // Keep the set of open streams in sync with the running containers
+  let busy = false;
+  const reconcile = async () => {
+    if (busy || closed) return;
+    busy = true;
+    try {
+      const running = await docker.listContainers({ filters: PROJECT });
+      const ids = new Set(running.map((c) => c.Id));
+      await Promise.all([...ids].map(open));
+      for (const [id, s] of streams) {
+        if (!ids.has(id)) {
+          s.destroy();
+          drop(id);
+        }
+      }
+    } catch {
+      /* docker unreachable; retry on the next tick */
+    } finally {
+      busy = false;
+    }
+  };
+
+  res.on('close', () => {
+    closed = true;
+    clearInterval(reconcileTimer);
+    clearInterval(snapshotTimer);
+    for (const s of streams.values()) s.destroy();
+    streams.clear();
+  });
+
+  await reconcile();
+  if (closed) return;
+
+  reconcileTimer = setInterval(reconcile, 10_000);
+  snapshotTimer = setInterval(() => send('snapshot', Object.fromEntries(latest)), 2_000);
+}));
+
+router.use((err: HttpError, _req: Request, res: Response, _next: NextFunction) => {
+  if (res.headersSent) return void res.end();
+  const status = err.status ?? err.statusCode ?? 500; // dockerode uses statusCode
+  if (status >= 500) console.error('[docker-backend]', err);
+  res.status(status).json({ error: status >= 500 ? 'Internal error' : err.message });
+});
+
+export default router;

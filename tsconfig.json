@@ -1,8 +1,9 @@
 {
   "compilerOptions": {
     /* Language and Environment */
-    "target": "esnext",
-    "module": "commonjs",
+    "target": "ESNext",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
     "lib": ["esnext"],
 
     /* Output */

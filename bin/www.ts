@@ -6,7 +6,7 @@
 
 import http from 'http';
 import debugLib from 'debug';
-import app from '../app';
+import app from '../app.js';
 
 const debug = debugLib('auth-backend:server');
 

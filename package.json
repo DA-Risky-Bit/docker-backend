@@ -1,22 +1,28 @@
 {
-  "name": "leaderboard-backend",
+  "name": "docker-backend",
   "version": "0.0.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "tsx watch ./bin/www.ts",
     "build": "tsc",
-    "start": "node dist/bin/www.js"
+    "start": "node dist/bin/www.js",
+    "lint": "oxlint",
+    "lint:fix": "oxlint --fix"
   },
   "dependencies": {
     "cookie-parser": "~1.4.4",
     "dockerode": "^5.0.1",
     "dockerode-compose": "^1.4.0",
+    "dotenv": "^18.0.10",
     "express": "^4.22.3",
     "http-errors": "~1.6.3",
+    "jsonwebtoken": "^9.0.3",
     "morgan": "^1.12.1",
     "tsx": "^4.23.15"
   },
   "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/cookie-parser": "^1.4.10",
     "@types/debug": "^4.1.13",
     "@types/dockerode": "^4.0.2",
@@ -24,8 +30,20 @@
     "@types/express": "^5.0.6",
     "@types/http-errors": "^2.0.5",
     "@types/morgan": "^1.9.10",
-    "@types/node": "^26.6.5",
+    "@types/node": "^26.6.6",
     "oxlint": "^1.94.0",
     "typescript": "^7.0.2"
+  },
+  "overrides": {
+    "dockerode-compose": {
+      "tar-fs": "^3.0.6",
+      "uuid": "^11.1.1"
+    }
+  },
+  "allowScripts": {
+    "cpu-features@0.0.10": true,
+    "esbuild@0.28.2": true,
+    "protobufjs@7.6.6": true,
+    "ssh2@1.17.0": true
   }
 }

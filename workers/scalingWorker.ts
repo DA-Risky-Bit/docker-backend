@@ -1,4 +1,4 @@
-import { dockerScaler } from '../services/dockerScaler';
+import { dockerScaler } from '../services/dockerScaler.js';
 
 interface FrontendService {
   serviceName: string;
